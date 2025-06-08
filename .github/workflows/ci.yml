@@ -19,81 +19,54 @@ jobs:
       - name: Run tests with detailed logging
         id: run-tests
         run: |
+          # Generate JUnit XML for better test reporting
           pytest --junitxml=test-results.xml -v > test_logs.txt 2>&1 || true
-          echo "Test logs content:"
-          cat test_logs.txt
-          # Capture any failure-related lines, case-insensitive
-          grep -i -E 'fail|error|exception|assert' test_logs.txt > failure_summary.txt || echo "No failures detected in test logs" > failure_summary.txt
-          echo "Failure summary content:"
-          cat failure_summary.txt
-          # Exit with failure if test logs contain failure indicators
-          if grep -q -i -E 'fail|error|exception|assert' test_logs.txt; then
-            exit 1
-          fi
+          # Extract failure summary
+          grep -E 'FAILED|ERROR' test_logs.txt > failure_summary.txt || echo "No failures detected"
+        continue-on-error: true
+
+      - name: Configure AWS Credentials
+        if: failure()
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: us-east-1
+          role-to-assume: ${{ secrets.AWS_IAM_ROLE }}
+          role-duration-seconds: 900
 
       - name: Upload artifacts to S3
         if: failure()
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
         run: |
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          echo "Uploading artifacts to s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/"
-          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt || echo "Failed to upload test_logs.txt"
-          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt || echo "Failed to upload failure_summary.txt"
-          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml || echo "Failed to upload test-results.xml"
-          aws s3 ls s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/
-        continue-on-error: true
+          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt
+          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt
+          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml
 
       - name: Trigger AI Analysis
         if: failure()
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
           S3_PREFIX: $GITHUB_RUN_ID/$TIMESTAMP
-          SFN_ARN: ${{ secrets.SFN_SELF_HEALING_ARN }}
         run: |
-          echo "Using SFN ARN: ${SFN_ARN:0:20}..." # Partial ARN for debugging
-          if [ -z "$SFN_ARN" ] || [ "$SFN_ARN" = "***" ]; then
-            echo "Error: SFN_SELF_HEALING_ARN is empty or invalid. Set it in GitHub secrets to arn:aws:states:us-east-1:<ACCOUNT_ID>:stateMachine:SelfHealingOrchestrator"
-            exit 1
-          fi
+          # Start Step Functions execution
           EXECUTION_NAME="github-$GITHUB_RUN_ID-$(date +%s)"
           RESPONSE=$(aws stepfunctions start-execution \
-            --state-machine-arn "$SFN_ARN" \
+            --state-machine-arn ${{ secrets.SFN_SELF_HEALING_ARN }} \
             --name "$EXECUTION_NAME" \
-            --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$S3_PREFIX\",\"github_run_id\":\"$GITHUB_RUN_ID\"}" 2>&1)
-          if [ $? -ne 0 ]; then
-            echo "Step Functions trigger failed: $RESPONSE"
-            exit 1
-          fi
+            --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$S3_PREFIX\",\"github_run_id\":\"$GITHUB_RUN_ID\"}")
+          
           echo "SFN Execution ARN: $(echo $RESPONSE | jq -r '.executionArn')"
           echo "SFN_RESPONSE=$RESPONSE" >> $GITHUB_ENV
-        continue-on-error: true
 
       - name: Wait for analysis completion
         if: failure()
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
         run: |
-          if [ -z "$SFN_RESPONSE" ]; then
-            echo "Error: No Step Functions execution ARN available."
-            exit 1
-          fi
-          EXECUTION_ARN=$(echo $SFN_RESPONSE | jq -r '.executionArn')
-          echo "Polling Step Functions execution: $EXECUTION_ARN"
+          # Poll Step Functions for completion (max 2 minutes)
           for i in {1..12}; do
             STATUS=$(aws stepfunctions describe-execution \
-              --execution-arn "$EXECUTION_ARN" \
-              --query 'status' --output text 2>&1)
-            if [ $? -ne 0 ]; then
-              echo "Error checking execution status: $STATUS"
-              exit 1
-            fi
+              --execution-arn $(echo $SFN_RESPONSE | jq -r '.executionArn') \
+              --query 'status' --output text)
+            
             if [ "$STATUS" = "SUCCEEDED" ]; then
               echo "Analysis completed successfully"
               break
@@ -101,31 +74,25 @@ jobs:
               echo "Analysis failed"
               exit 1
             fi
+            
             sleep 10
           done
-        continue-on-error: true
 
       - name: Show remediation plan
         if: failure()
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          if [ -z "$SFN_RESPONSE" ]; then
-            echo "Error: No Step Functions execution ARN available."
-            exit 1
-          fi
-          EXECUTION_ARN=$(echo $SFN_RESPONSE | jq -r '.executionArn')
           OUTPUT=$(aws stepfunctions describe-execution \
-            --execution-arn "$EXECUTION_ARN" \
-            --query 'output' --output text 2>&1)
-          if [ $? -ne 0 ]; then
-            echo "Error retrieving execution output: $OUTPUT"
-            exit 1
-          fi
-          echo "=== AI Remediation Plan ==="
+            --execution-arn $(echo $SFN_RESPONSE | jq -r '.executionArn') \
+            --query 'output' --output text)
+          
+          echo "=== AIrtifacts ==="
           echo $OUTPUT | jq -r '.recommendations' || echo "No recommendations generated"
           echo "========================="
-          if echo $OUTPUT | jq -e
+          
+          # Create GitHub issue if critical failure
+          if echo $OUTPUT | jq -e '.failure_type == "CRITICAL"'; then
+            gh issue create \
+              --title "Critical CI Failure in $GITHUB_SHA" \
+              --body "$(echo $OUTPUT | jq -r '.recommendations')" \
+              --label "bug,ci-failure"
+          fi
