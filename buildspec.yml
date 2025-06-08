@@ -1,23 +1,19 @@
 version: 0.2
-
 phases:
   install:
+    runtime-versions:
+      python: 3.10
     commands:
-      - pip install flask pytest boto3 awscli
+      - pip install flask pytest
   pre_build:
     commands:
-      - echo "Checking for AI-generated code fix..."
-      - |
-        if [ -n "$CODE_FIX" ]; then
-          echo "Applying code fix: $CODE_FIX"
-          eval "$CODE_FIX"
-        fi
-      - git config --global user.name "Self-Healing Pipeline"
+      - echo "Applying code fix"
+      - if [ -n "$CODE_FIX" ]; then eval "$CODE_FIX"; fi
+      - git config --global user.name "Self-HealingCI"
       - git config --global user.email "selfhealing@example.com"
-      - git add app.py || true
-      - git commit -m "AI self-healing: Apply fix for test failure" || echo "No changes to commit"
-      # Uncomment the next line if you want to push the fix to GitHub
-      # - git push https://$GITHUB_TOKEN@github.com/TATULIBOS1/self-healing-ci-cd-demo.git || echo "Push failed"
+      - git add app.py
+      - git commit -m "AI self-healing: Fix test failure" || true
+      - git push https://$GITHUB_TOKEN@github.com/TATULIBOS1/self-healing-ci-cd-demo.git
   build:
     commands:
       - pytest -v
