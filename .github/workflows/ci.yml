@@ -14,28 +14,48 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: pip install flask pytest boto3
+        run: pip install flask pytest boto3 awscli jq
 
       - name: Run tests with detailed logging
         id: run-tests
         run: |
           pytest --junitxml=test-results.xml -v > test_logs.txt 2>&1
-          grep -E 'FAILED|ERROR' test_logs.txt > failure_summary.txt || echo "No failures detected"
-          if grep -q 'FAILED\|ERROR' test_logs.txt; then
+          echo "Test logs content:"
+          cat test_logs.txt
+          grep -E 'FAILED|ERROR|Exception' test_logs.txt > failure_summary.txt || echo "No failures detected" > failure_summary.txt
+          if [ -s failure_summary.txt ]; then
+            echo "Failure summary generated:"
+            cat failure_summary.txt
+          else
+            echo "No failure summary generated, creating fallback"
+            echo "Test failed, check test_logs.txt" > failure_summary.txt
+          fi
+          if grep -q 'FAILED\|ERROR\|Exception' test_logs.txt; then
             echo "Tests failed, marking job as failed"
             exit 1
           fi
 
-      - name: Validate Step Functions ARN
+      - name: Validate AWS Credentials and ARN
         if: failure()
         env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
           SFN_ARN: ${{ secrets.SFN_SELF_HEALING_ARN }}
         run: |
+          if [[ -z "$AWS_ACCESS_KEY_ID" || -z "$AWS_SECRET_ACCESS_KEY" ]]; then
+            echo "Error: AWS credentials are missing"
+            exit 1
+          fi
           if [[ -z "$SFN_ARN" || "$SFN_ARN" == "***" ]]; then
             echo "Error: SFN_SELF_HEALING_ARN is missing or invalid"
             exit 1
           fi
-          echo "SFN ARN is set: $SFN_ARN"
+          echo "Validating AWS credentials..."
+          aws sts get-caller-identity || { echo "Error: Invalid AWS credentials"; exit 1; }
+          echo "Validating Step Functions ARN..."
+          aws stepfunctions describe-state-machine --state-machine-arn "$SFN_ARN" || { echo "Error: Invalid SFN ARN"; exit 1; }
+          echo "AWS credentials and SFN ARN are valid"
 
       - name: Upload artifacts to S3
         if: failure()
@@ -45,9 +65,10 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt
-          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt
-          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml
+          ls -l test_logs.txt failure_summary.txt test-results.xml || { echo "Error: Required files missing"; exit 1; }
+          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt || { echo "Error: S3 upload failed for full_logs.txt"; exit 1; }
+          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt || { echo "Error: S3 upload failed for failure_summary.txt"; exit 1; }
+          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml || { echo "Error: S3 upload failed for test_results.xml"; exit 1; }
           echo "S3_PREFIX=$GITHUB_RUN_ID/$TIMESTAMP" >> $GITHUB_ENV
 
       - name: Trigger AI Analysis
@@ -128,5 +149,5 @@ jobs:
             gh issue create \
               --title "Critical CI Failure in $GITHUB_SHA" \
               --body-file issue_body.txt \
-              --label "bug,ci-failure"
+              --label "bug,ci-failure" || { echo "Error: Failed to create GitHub issue"; exit 1; }
           fi
