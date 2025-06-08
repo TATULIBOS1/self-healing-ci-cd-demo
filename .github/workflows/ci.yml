@@ -36,6 +36,7 @@ jobs:
           aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt
           aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt
           aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml
+        continue-on-error: true
 
       - name: Trigger AI Analysis
         if: failure()
@@ -44,15 +45,25 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
           AWS_DEFAULT_REGION: us-east-1
           S3_PREFIX: $GITHUB_RUN_ID/$TIMESTAMP
+          SFN_ARN: ${{ secrets.SFN_SELF_HEALING_ARN }}
         run: |
+          echo "Using SFN ARN: $SFN_ARN"
+          if [ -z "$SFN_ARN" ] || [ "$SFN_ARN" = "***" ]; then
+            echo "Error: SFN_SELF_HEALING_ARN is empty or invalid. Please set it in GitHub secrets."
+            exit 1
+          fi
           EXECUTION_NAME="github-$GITHUB_RUN_ID-$(date +%s)"
           RESPONSE=$(aws stepfunctions start-execution \
-            --state-machine-arn ${{ secrets.SFN_SELF_HEALING_ARN }} \
+            --state-machine-arn "$SFN_ARN" \
             --name "$EXECUTION_NAME" \
-            --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$S3_PREFIX\",\"github_run_id\":\"$GITHUB_RUN_ID\"}")
-
+            --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$S3_PREFIX\",\"github_run_id\":\"$GITHUB_RUN_ID\"}" 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "Step Functions trigger failed: $RESPONSE"
+            exit 1
+          fi
           echo "SFN Execution ARN: $(echo $RESPONSE | jq -r '.executionArn')"
           echo "SFN_RESPONSE=$RESPONSE" >> $GITHUB_ENV
+        continue-on-error: true
 
       - name: Wait for analysis completion
         if: failure()
@@ -61,11 +72,19 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
+          if [ -z "$SFN_RESPONSE" ]; then
+            echo "Error: No Step Functions execution ARN available."
+            exit 1
+          fi
+          EXECUTION_ARN=$(echo $SFN_RESPONSE | jq -r '.executionArn')
           for i in {1..12}; do
             STATUS=$(aws stepfunctions describe-execution \
-              --execution-arn $(echo $SFN_RESPONSE | jq -r '.executionArn') \
-              --query 'status' --output text)
-
+              --execution-arn "$EXECUTION_ARN" \
+              --query 'status' --output text 2>&1)
+            if [ $? -ne 0 ]; then
+              echo "Error checking execution status: $STATUS"
+              exit 1
+            fi
             if [ "$STATUS" = "SUCCEEDED" ]; then
               echo "Analysis completed successfully"
               break
@@ -73,9 +92,9 @@ jobs:
               echo "Analysis failed"
               exit 1
             fi
-
             sleep 10
           done
+        continue-on-error: true
 
       - name: Show remediation plan
         if: failure()
@@ -85,14 +104,17 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
+          EXECUTION_ARN=$(echo $SFN_RESPONSE | jq -r '.executionArn')
           OUTPUT=$(aws stepfunctions describe-execution \
-            --execution-arn $(echo $SFN_RESPONSE | jq -r '.executionArn') \
-            --query 'output' --output text)
-
+            --execution-arn "$EXECUTION_ARN" \
+            --query 'output' --output text 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "Error retrieving execution output: $OUTPUT"
+            exit 1
+          fi
           echo "=== AI Remediation Plan ==="
           echo $OUTPUT | jq -r '.recommendations' || echo "No recommendations generated"
           echo "========================="
-
           if echo $OUTPUT | jq -e '.failure_type == "CRITICAL"'; then
             echo "$OUTPUT" | jq -r '.recommendations' > issue_body.txt
             gh issue create \
@@ -100,3 +122,4 @@ jobs:
               --body-file issue_body.txt \
               --label "bug,ci-failure"
           fi
+        continue-on-error: true
