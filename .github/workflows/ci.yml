@@ -20,11 +20,22 @@ jobs:
         id: run-tests
         run: |
           pytest --junitxml=test-results.xml -v > test_logs.txt 2>&1
-          touch failure_summary.txt
-          grep -E 'FAILED|ERROR' test_logs.txt >> failure_summary.txt || echo "No failures detected" >> failure_summary.txt
+          grep -E 'FAILED|ERROR' test_logs.txt > failure_summary.txt || echo "No failures detected"
           if grep -q 'FAILED\|ERROR' test_logs.txt; then
+            echo "Tests failed, marking job as failed"
             exit 1
           fi
+
+      - name: Validate Step Functions ARN
+        if: failure()
+        env:
+          SFN_ARN: ${{ secrets.SFN_SELF_HEALING_ARN }}
+        run: |
+          if [[ -z "$SFN_ARN" || "$SFN_ARN" == "***" ]]; then
+            echo "Error: SFN_SELF_HEALING_ARN is missing or invalid"
+            exit 1
+          fi
+          echo "SFN ARN is set: $SFN_ARN"
 
       - name: Upload artifacts to S3
         if: failure()
@@ -34,9 +45,10 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt || echo "Failed to upload test_logs.txt"
-          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt || echo "Failed to upload failure_summary.txt"
-          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml || echo "Failed to upload test-results.xml"
+          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt
+          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt
+          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml
+          echo "S3_PREFIX=$GITHUB_RUN_ID/$TIMESTAMP" >> $GITHUB_ENV
 
       - name: Trigger AI Analysis
         if: failure()
@@ -44,13 +56,18 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
           AWS_DEFAULT_REGION: us-east-1
-          S3_PREFIX: $GITHUB_RUN_ID/$TIMESTAMP
+          S3_PREFIX: ${{ env.S3_PREFIX }}
         run: |
           EXECUTION_NAME="github-$GITHUB_RUN_ID-$(date +%s)"
+          echo "Starting Step Functions execution: $EXECUTION_NAME"
           RESPONSE=$(aws stepfunctions start-execution \
             --state-machine-arn ${{ secrets.SFN_SELF_HEALING_ARN }} \
             --name "$EXECUTION_NAME" \
-            --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$S3_PREFIX\",\"github_run_id\":\"$GITHUB_RUN_ID\"}")
+            --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$S3_PREFIX\",\"github_run_id\":\"$GITHUB_RUN_ID\"}" 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "Error starting Step Functions: $RESPONSE"
+            exit 1
+          fi
           echo "SFN Execution ARN: $(echo $RESPONSE | jq -r '.executionArn')"
           echo "SFN_RESPONSE=$RESPONSE" >> $GITHUB_ENV
 
@@ -61,10 +78,20 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
+          EXECUTION_ARN=$(echo $SFN_RESPONSE | jq -r '.executionArn')
+          if [ -z "$EXECUTION_ARN" ]; then
+            echo "Error: No valid execution ARN found"
+            exit 1
+          fi
           for i in {1..12}; do
             STATUS=$(aws stepfunctions describe-execution \
-              --execution-arn $(echo $SFN_RESPONSE | jq -r '.executionArn') \
-              --query 'status' --output text)
+              --execution-arn "$EXECUTION_ARN" \
+              --query 'status' --output text 2>&1)
+            if [ $? -ne 0 ]; then
+              echo "Error checking execution status: $STATUS"
+              exit 1
+            fi
+            echo "Execution status: $STATUS"
             if [ "$STATUS" = "SUCCEEDED" ]; then
               echo "Analysis completed successfully"
               break
@@ -83,14 +110,21 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
+          EXECUTION_ARN=$(echo $SFN_RESPONSE | jq -r '.executionArn')
           OUTPUT=$(aws stepfunctions describe-execution \
-            --execution-arn $(echo $SFN_RESPONSE | jq -r '.executionArn') \
-            --query 'output' --output text)
+            --execution-arn "$EXECUTION_ARN" \
+            --query 'output' --output text 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "Error retrieving execution output: $OUTPUT"
+            exit 1
+          fi
           echo "=== AI Remediation Plan ==="
-          echo $OUTPUT | jq -r '.recommendations' || echo "No recommendations generated"
+          RECOMMENDATIONS=$(echo $OUTPUT | jq -r '.recommendations' || echo "No recommendations generated")
+          echo "$RECOMMENDATIONS"
           echo "========================="
-          if echo $OUTPUT | jq -e '.failure_type == "CRITICAL"'; then
-            echo "$OUTPUT" | jq -r '.recommendations' > issue_body.txt
+          FAILURE_TYPE=$(echo $OUTPUT | jq -r '.failure_type')
+          if [ "$FAILURE_TYPE" = "CRITICAL" ]; then
+            echo "$RECOMMENDATIONS" > issue_body.txt
             gh issue create \
               --title "Critical CI Failure in $GITHUB_SHA" \
               --body-file issue_body.txt \
