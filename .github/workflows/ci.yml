@@ -20,7 +20,8 @@ jobs:
         id: run-tests
         run: |
           pytest --junitxml=test-results.xml -v > test_logs.txt 2>&1
-          grep -E 'FAILED|ERROR' test_logs.txt > failure_summary.txt || echo "No failures detected"
+          touch failure_summary.txt
+          grep -E 'FAILED|ERROR' test_logs.txt >> failure_summary.txt || echo "No failures detected" >> failure_summary.txt
           if grep -q 'FAILED\|ERROR' test_logs.txt; then
             exit 1
           fi
@@ -33,9 +34,9 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt
-          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt
-          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml
+          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt || echo "Failed to upload test_logs.txt"
+          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt || echo "Failed to upload failure_summary.txt"
+          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml || echo "Failed to upload test-results.xml"
 
       - name: Trigger AI Analysis
         if: failure()
@@ -50,7 +51,6 @@ jobs:
             --state-machine-arn ${{ secrets.SFN_SELF_HEALING_ARN }} \
             --name "$EXECUTION_NAME" \
             --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$S3_PREFIX\",\"github_run_id\":\"$GITHUB_RUN_ID\"}")
-
           echo "SFN Execution ARN: $(echo $RESPONSE | jq -r '.executionArn')"
           echo "SFN_RESPONSE=$RESPONSE" >> $GITHUB_ENV
 
@@ -65,7 +65,6 @@ jobs:
             STATUS=$(aws stepfunctions describe-execution \
               --execution-arn $(echo $SFN_RESPONSE | jq -r '.executionArn') \
               --query 'status' --output text)
-
             if [ "$STATUS" = "SUCCEEDED" ]; then
               echo "Analysis completed successfully"
               break
@@ -73,7 +72,6 @@ jobs:
               echo "Analysis failed"
               exit 1
             fi
-
             sleep 10
           done
 
@@ -88,11 +86,9 @@ jobs:
           OUTPUT=$(aws stepfunctions describe-execution \
             --execution-arn $(echo $SFN_RESPONSE | jq -r '.executionArn') \
             --query 'output' --output text)
-
           echo "=== AI Remediation Plan ==="
           echo $OUTPUT | jq -r '.recommendations' || echo "No recommendations generated"
           echo "========================="
-
           if echo $OUTPUT | jq -e '.failure_type == "CRITICAL"'; then
             echo "$OUTPUT" | jq -r '.recommendations' > issue_body.txt
             gh issue create \
