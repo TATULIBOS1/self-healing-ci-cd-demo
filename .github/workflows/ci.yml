@@ -168,4 +168,3 @@ jobs:
               --label "bug,issues" \
               --repo "$GITHUB_REPOSITORY" || echo "Failed to create GitHub issue"
           fi
-fi
