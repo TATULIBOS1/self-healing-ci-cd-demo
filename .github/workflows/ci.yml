@@ -1,9 +1,9 @@
-name: AI-Powered Self-Healing CI/CD
+name: AI Self-Healing CI/CD Demo
 
 on: [push]
 
 jobs:
-  build-and-test:
+  build-test-remediate:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -17,48 +17,179 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run tests and create logs
+      - name: Run tests and capture logs
         id: run-tests
+        continue-on-error: true  # Critical for self-healing flow
         run: |
+          # Run tests and capture detailed output
           pytest --junitxml=test-results.xml -v > test_logs.txt 2>&1 || true
-          grep -Ei 'FAILED|ERROR|Exception' test_logs.txt > failure_summary.txt || echo "No failures found" > failure_summary.txt
+          
+          # Generate comprehensive failure report
+          {
+            echo "CI/CD FAILURE REPORT"
+            echo "===================="
+            echo "Run ID: $GITHUB_RUN_ID"
+            echo "Commit: $GITHUB_SHA"
+            echo "Timestamp: $(date)"
+            echo ""
+            echo "TEST FAILURES:"
+            grep -E 'FAILED|ERROR' test_logs.txt || echo "No test failures detected"
+            echo ""
+            echo "EXCEPTIONS:"
+            grep -i -E 'exception|error|critical' test_logs.txt | grep -v 'FAILED' || echo "No exceptions found"
+            echo ""
+            echo "LAST 20 LINES:"
+            tail -20 test_logs.txt
+          } > failure_summary.txt
+          
+          # Show failure details in logs
+          echo "Test execution completed with status: $?"
           cat failure_summary.txt
-          if grep -qEi 'FAILED|ERROR|Exception' test_logs.txt; then
-            echo "Tests failed"
-            echo "failure=true" >> $GITHUB_ENV
-          else
-            echo "Tests passed"
-            echo "failure=false" >> $GITHUB_ENV
 
-      - name: Upload artifacts to S3
-        if: env.failure == 'true'
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
+      - name: Configure AWS CLI
+        if: failure() && steps.run-tests.outcome == 'failure'
+        run: |
+          aws --version
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_KEY }}
+          aws configure set default.region us-east-1
+
+      - name: Validate AWS access
+        if: failure() && steps.run-tests.outcome == 'failure'
+        run: |
+          echo "Validating AWS credentials..."
+          aws sts get-caller-identity || exit 1
+          
+          echo "Checking S3 access..."
+          aws s3 ls s3://ci-cd-demo-logs || exit 1
+          
+          echo "Verifying Step Functions ARN..."
+          if [ -z "${{ secrets.SFN_ARN }}" ]; then
+            echo "Error: SFN_ARN secret is missing"
+            exit 1
+          fi
+
+      - name: Upload diagnostic data to S3
+        if: failure() && steps.run-tests.outcome == 'failure'
         run: |
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          echo "S3_PREFIX=$GITHUB_RUN_ID/$TIMESTAMP" >> $GITHUB_ENV
-          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt
-          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt
-          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml
+          S3_PATH="failures/$GITHUB_RUN_ID/$TIMESTAMP"
+          
+          echo "Uploading diagnostic data to s3://ci-cd-demo-logs/$S3_PATH/"
+          
+          # Upload critical files
+          aws s3 cp failure_summary.txt "s3://ci-cd-demo-logs/$S3_PATH/failure_summary.txt"
+          aws s3 cp test_logs.txt "s3://ci-cd-demo-logs/$S3_PATH/full_logs.txt"
+          aws s3 cp test-results.xml "s3://ci-cd-demo-logs/$S3_PATH/test_results.xml"
+          
+          echo "S3_PATH=$S3_PATH" >> $GITHUB_ENV
 
-      - name: Trigger Step Functions (AI Analysis)
-        if: env.failure == 'true'
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
+      - name: Trigger AI analysis
+        if: failure() && steps.run-tests.outcome == 'failure' && env.S3_PATH != ''
         run: |
-          EXECUTION_NAME="github-$GITHUB_RUN_ID-$(date +%s)"
-          echo "Triggering Step Function: $EXECUTION_NAME"
+          echo "Initiating AI analysis workflow..."
+          
+          INPUT_JSON=$(jq -n \
+            --arg bucket "ci-cd-demo-logs" \
+            --arg prefix "${{ env.S3_PATH }}" \
+            --arg runId "$GITHUB_RUN_ID" \
+            '{
+              "s3_bucket": $bucket,
+              "s3_prefix": $prefix,
+              "github_run_id": $runId,
+              "metadata": {
+                "repo": "${{ github.repository }}",
+                "commit": "${{ github.sha }}",
+                "branch": "${{ github.ref_name }}"
+              }
+            }')
+          
+          echo "Execution input:"
+          echo "$INPUT_JSON"
+          
           RESPONSE=$(aws stepfunctions start-execution \
-            --state-machine-arn "${{ secrets.SFN_SELF_HEALING_ARN }}" \
-            --name "$EXECUTION_NAME" \
-            --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$GITHUB_RUN_ID/$TIMESTAMP\",\"github_run_id\":\"$GITHUB_RUN_ID\"}")
-          echo "SFN_RESPONSE=$RESPONSE" >> $GITHUB_ENV
-          echo $RESPONSE | jq
+            --state-machine-arn "${{ secrets.SFN_ARN }}" \
+            --name "github-$GITHUB_RUN_ID" \
+            --input "$INPUT_JSON")
+          
+          echo "Execution ARN: $(echo $RESPONSE | jq -r '.executionArn')"
+          echo "EXECUTION_ARN=$(echo $RESPONSE | jq -r '.executionArn')" >> $GITHUB_ENV
 
-      - name: Display remediation output
-        if: env.failure == 'true'
-        run: echo "Remediation in progress via Step Functions. Check DynamoDB and CloudWatch logs."
+      - name: Monitor remediation
+        if: failure() && steps.run-tests.outcome == 'failure' && env.EXECUTION_ARN != ''
+        run: |
+          echo "Monitoring remediation progress..."
+          
+          for i in {1..12}; do
+            STATUS=$(aws stepfunctions describe-execution \
+              --execution-arn "${{ env.EXECUTION_ARN }}" \
+              --query 'status' \
+              --output text)
+            
+            echo "Current status: $STATUS"
+            
+            case $STATUS in
+              "SUCCEEDED") break ;;
+              "FAILED") exit 1 ;;
+              *) sleep 10 ;;
+            esac
+          done
+          
+          if [ "$STATUS" != "SUCCEEDED" ]; then
+            echo "Analysis timed out"
+            exit 0
+          fi
+          
+          # Get final output
+          OUTPUT=$(aws stepfunctions describe-execution \
+            --execution-arn "${{ env.EXECUTION_ARN }}" \
+            --query 'output' \
+            --output text | jq -r '.')
+          
+          echo "REMEDIATION_OUTPUT=$OUTPUT" >> $GITHUB_ENV
+
+      - name: Display remediation plan
+        if: failure() && steps.run-tests.outcome == 'failure' && env.REMEDIATION_OUTPUT != ''
+        run: |
+          echo "=== AI-Powered Remediation Plan ==="
+          echo "${{ env.REMEDIATION_OUTPUT }}" | jq -r '.recommendations'
+          echo "================================"
+          
+          # For thesis demonstration - save as artifact
+          echo "${{ env.REMEDIATION_OUTPUT }}" | jq -r '.recommendations' > remediation_plan.txt
+          echo "Remediation plan saved for documentation"
+
+      - name: Create GitHub issue for critical failures
+        if: failure() && steps.run-tests.outcome == 'failure' && env.REMEDIATION_OUTPUT != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          FAILURE_TYPE=$(echo "${{ env.REMEDIATION_OUTPUT }}" | jq -r '.failure_type')
+          
+          if [ "$FAILURE_TYPE" = "CRITICAL" ]; then
+            echo "Creating GitHub issue for critical failure..."
+            
+            ISSUE_BODY=$(cat <<EOF
+            **Critical CI/CD Failure Report**
+            
+            **Run ID:** $GITHUB_RUN_ID  
+            **Commit:** [$GITHUB_SHA](https://github.com/${{ github.repository }}/commit/$GITHUB_SHA)  
+            **Branch:** ${{ github.ref_name }}  
+            
+            **Failure Type:** $FAILURE_TYPE  
+            
+            **AI Recommendations:**  
+            $(echo "${{ env.REMEDIATION_OUTPUT }}" | jq -r '.recommendations')
+            
+            **Diagnostic Data:**  
+            Available in S3: ${{ env.S3_PATH }}
+            EOF
+            )
+            
+            gh issue create \
+              --title "[CRITICAL] Pipeline failure in ${{ github.ref_name }} @ $GITHUB_SHA" \
+              --body "$ISSUE_BODY" \
+              --label "bug,ci-failure,critical"
+          else
+            echo "Non-critical failure, no issue created"
+          fi
