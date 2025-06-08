@@ -1,8 +1,19 @@
-version: 0.2
+version: 0.3
 phases:
   install:
+    runtime-versions:
+      python: 3.10
     commands:
-      - pip install -r requirements.txt
+      - name: pip install -r requirements.txt
+      pip install flask pytest
+  pre_build:
+  commands:
+    - echo "Checking for AI-generated code fix..."
+    - if [ -n "$CODE_FIX" ]; then echo "Applying code fix: $CODE_FIX"; eval "$CODE_FIX"; fi
+    - git config --global user.name "Self-Healing Pipeline"
+    - git config --global user.email "selfhealing@example.com"
+    - git add app.py
+    - git commit -m "AI self-healing: Apply fix for test failure" || echo "No changes to commit"
+    - git push https://$GITHUB_TOKEN@github.com/TATULIBOS1/self-healing-ci-cd-demo.git || exit 1
   build:
-    commands:
-      - pytest -v
+    name: - pytest -v
