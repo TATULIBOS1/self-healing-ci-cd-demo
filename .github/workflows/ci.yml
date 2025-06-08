@@ -59,6 +59,7 @@ jobs:
           aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml || { echo "Failed to upload test-results.xml"; exit 1; }
           echo "Uploaded files:"
           aws s3 ls s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/ || { echo "Failed to list S3 uploads"; exit 1; }
+          echo "S3_PREFIX=$GITHUB_RUN_ID/$TIMESTAMP" >> $GITHUB_ENV
 
       - name: Trigger AI Analysis
         if: failure()
@@ -66,16 +67,21 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
           AWS_DEFAULT_REGION: us-east-1
+          S3_PREFIX: ${{ env.S3_PREFIX }}
           SFN_ARN: ${{ secrets.SFN_SELF_HEALING_ARN }}
         run: |
-          S3_PREFIX="$GITHUB_RUN_ID/$TIMESTAMP"
           echo "Using SFN ARN: ${SFN_ARN:0:20}..."
+          echo "S3 prefix: $S3_PREFIX"
           if [ -z "$SFN_ARN" ] || [ "$SFN_ARN" = "***" ]; then
-            echo "Error: SFN_SELF_HEALING_ARN is empty or invalid."
+            echo "Error: SFN_SELF_HEALING_ARN is empty or invalid. Set it to arn:aws:states:us-east-1:<ACCOUNT_ID>:stateMachine:SelfHealingOrchestrator"
             exit 1
           fi
           if [[ ! "$SFN_ARN" =~ ^arn:aws:states:us-east-1:[0-9]{12}:stateMachine:SelfHealingOrchestrator$ ]]; then
-            echo "Error: SFN_SELF_HEALING_ARN is not a valid Step Functions ARN."
+            echo "Error: SFN_SELF_HEALING_ARN is not a valid Step Functions ARN. Expected format: arn:aws:states:us-east-1:<12-digit-account-id>:stateMachine:SelfHealingOrchestrator"
+            exit 1
+          fi
+          if [ -z "$S3_PREFIX" ]; then
+            echo "Error: S3_PREFIX is empty."
             exit 1
           fi
           EXECUTION_NAME="github-$GITHUB_RUN_ID-$(date +%s)"
@@ -83,8 +89,15 @@ jobs:
             --state-machine-arn "$SFN_ARN" \
             --name "$EXECUTION_NAME" \
             --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$S3_PREFIX\",\"github_run_id\":\"$GITHUB_RUN_ID\"}")
+          if [ $? -ne 0 ]; then
+            echo "Step Functions trigger failed: $RESPONSE"
+            exit 1
+          fi
           echo "Raw SFN Response: $RESPONSE"
+          # Validate JSON
+          echo "$RESPONSE" | jq . > /dev/null 2>&1 || { echo "Error: Invalid JSON response from Step Functions"; exit 1; }
           EXECUTION_ARN=$(echo "$RESPONSE" | jq -r '.executionArn')
+          echo "SFN Execution ARN: $EXECUTION_ARN"
           echo "EXECUTION_ARN=$EXECUTION_ARN" >> $GITHUB_ENV
 
       - name: Wait for analysis completion
@@ -108,16 +121,20 @@ jobs:
               exit 1
             fi
             if [ "$STATUS" = "SUCCEEDED" ]; then
-              echo "Analysis completed successfully"
+              echo "Analysis completed successfully."
               break
             elif [ "$STATUS" = "FAILED" ]; then
-              echo "Analysis failed"
+              echo "Analysis failed. Retrieving failure details..."
+              FAILURE_DETAILS=$(aws stepfunctions describe-execution \
+                --execution-arn "$EXECUTION_ARN" \
+                --query '{cause: cause, error: error}' --output json 2>&1)
+              echo "Failure details: $FAILURE_DETAILS"
               exit 1
             fi
-            sleep 10
+            sleep 3
           done
 
-      - name: Show remediation plan
+      - name: Show remediation
         if: failure()
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
@@ -136,14 +153,19 @@ jobs:
             echo "Error retrieving output: $OUTPUT"
             exit 1
           fi
+          if [[ "$OUTPUT" == *"Error"* || -z "$OUTPUT" ]]; then
+            echo "No valid remediation plan available due to execution failure."
+            exit 1
+          fi
           echo "=== AI Remediation Plan ==="
           echo "$OUTPUT" | jq -r '.body | fromjson | .recommendations' || echo "No recommendations generated"
           echo "========================="
           if echo "$OUTPUT" | jq -e '.body | fromjson | .failure_type == "CRITICAL"'; then
             echo "$OUTPUT" | jq -r '.body | fromjson | .recommendations' > issue_body.txt
             gh issue create \
-              --title "Critical CI Failure in $GITHUB_SHA" \
+              --title "Test Failure in $GITHUB_SHA" \
               --body-file issue_body.txt \
-              --label "bug,ci-failure" \
-              --repo $GITHUB_REPOSITORY || echo "Failed to create GitHub issue"
+              --label "bug,issues" \
+              --repo "$GITHUB_REPOSITORY" || echo "Failed to create GitHub issue"
           fi
+fi
