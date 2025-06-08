@@ -58,7 +58,7 @@ jobs:
           aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt || { echo "Failed to upload failure_summary.txt"; exit 1; }
           aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml || { echo "Failed to upload test-results.xml"; exit 1; }
           echo "Uploaded files:"
-          aws s3 ls s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/ || echo "Failed to list S3 uploads"
+          aws s3 ls s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/ || { echo "Failed to list S3 uploads"; exit 1; }
 
       - name: Trigger AI Analysis
         if: failure()
@@ -82,12 +82,16 @@ jobs:
           RESPONSE=$(aws stepfunctions start-execution \
             --state-machine-arn "$SFN_ARN" \
             --name "$EXECUTION_NAME" \
-            --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$S3_PREFIX\",\"github_run_id\":\"$GITHUB_RUN_ID\"}" 2>&1)
+            --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$S3_PREFIX\",\"github_run_id\":\"$GITHUB_RUN_ID\"}")
           if [ $? -ne 0 ]; then
             echo "Step Functions trigger failed: $RESPONSE"
             exit 1
           fi
-          echo "SFN Execution ARN: $(echo $RESPONSE | jq -r '.executionArn')"
+          echo "Raw SFN Response: $RESPONSE"
+          # Validate JSON
+          echo "$RESPONSE" | jq . > /dev/null 2>&1 || { echo "Error: Invalid JSON response from Step Functions"; exit 1; }
+          EXECUTION_ARN=$(echo "$RESPONSE" | jq -r '.executionArn')
+          echo "SFN Execution ARN: $EXECUTION_ARN"
           echo "SFN_RESPONSE=$RESPONSE" >> $GITHUB_ENV
 
       - name: Wait for analysis completion
@@ -101,7 +105,12 @@ jobs:
             echo "Error: No Step Functions execution ARN available."
             exit 1
           fi
-          EXECUTION_ARN=$(echo $SFN_RESPONSE | jq -r '.executionArn')
+          EXECUTION_ARN=$(echo "$SFN_RESPONSE" | jq -r '.executionArn')
+          if [ -z "$EXECUTION_ARN" ]; then
+            echo "Error: Failed to extract execution ARN from SFN_RESPONSE"
+            echo "SFN_RESPONSE content: $SFN_RESPONSE"
+            exit 1
+          fi
           echo "Polling execution: $EXECUTION_ARN"
           for i in {1..12}; do
             STATUS=$(aws stepfunctions describe-execution \
@@ -133,7 +142,11 @@ jobs:
             echo "Error: No Step Functions execution ARN available."
             exit 1
           fi
-          EXECUTION_ARN=$(echo $SFN_RESPONSE | jq -r '.executionArn')
+          EXECUTION_ARN=$(echo "$SFN_RESPONSE" | jq -r '.executionArn')
+          if [ -z "$EXECUTION_ARN" ]; then
+            echo "Error: Failed to extract execution ARN from SFN_RESPONSE"
+            exit 1
+          fi
           OUTPUT=$(aws stepfunctions describe-execution \
             --execution-arn "$EXECUTION_ARN" \
             --query 'output' --output text 2>&1)
@@ -142,9 +155,9 @@ jobs:
             exit 1
           fi
           echo "=== AI Remediation Plan ==="
-          echo $OUTPUT | jq -r '.body | fromjson | .recommendations' || echo "No recommendations generated"
+          echo "$OUTPUT" | jq -r '.body | fromjson | .recommendations' || echo "No recommendations generated"
           echo "========================="
-          if echo $OUTPUT | jq -e '.body | fromjson | .failure_type == "CRITICAL"'; then
+          if echo "$OUTPUT" | jq -e '.body | fromjson | .failure_type == "CRITICAL"'; then
             echo "$OUTPUT" | jq -r '.body | fromjson | .recommendations' > issue_body.txt
             gh issue create \
               --title "Critical CI Failure in $GITHUB_SHA" \
