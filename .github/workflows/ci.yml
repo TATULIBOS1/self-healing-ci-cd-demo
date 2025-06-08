@@ -54,9 +54,10 @@ jobs:
         run: |
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
           echo "Uploading to s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/"
-          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt || echo "Failed to upload test_logs.txt"
-          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt || echo "Failed to upload failure_summary.txt"
-          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml || echo "Failed to upload test-results.xml"
+          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt || { echo "Failed to upload test_logs.txt"; exit 1; }
+          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt || { echo "Failed to upload failure_summary.txt"; exit 1; }
+          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml || { echo "Failed to upload test-results.xml"; exit 1; }
+          echo "Uploaded files:"
           aws s3 ls s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/ || echo "Failed to list S3 uploads"
 
       - name: Trigger AI Analysis
@@ -71,6 +72,10 @@ jobs:
           echo "Using SFN ARN: ${SFN_ARN:0:20}..."
           if [ -z "$SFN_ARN" ] || [ "$SFN_ARN" = "***" ]; then
             echo "Error: SFN_SELF_HEALING_ARN is empty or invalid. Set it to arn:aws:states:us-east-1:<ACCOUNT_ID>:stateMachine:SelfHealingOrchestrator"
+            exit 1
+          fi
+          if [[ ! "$SFN_ARN" =~ ^arn:aws:states:us-east-1:[0-9]{12}:stateMachine:SelfHealingOrchestrator$ ]]; then
+            echo "Error: SFN_SELF_HEALING_ARN is not a valid Step Functions ARN. Expected format: arn:aws:states:us-east-1:<12-digit-account-id>:stateMachine:SelfHealingOrchestrator"
             exit 1
           fi
           EXECUTION_NAME="github-$GITHUB_RUN_ID-$(date +%s)"
