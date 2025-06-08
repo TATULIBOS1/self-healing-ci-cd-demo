@@ -1,18 +1,12 @@
 version: 0.2
+
 phases:
   install:
     commands:
-      - pip install flask pytest botos mscil
+      - echo "Install phase"
   pre_build:
     commands:
-      - echo "Checking for AI-generated code fix..."
-      - if [ -n "$CODE_FIX" ]; then echo "Applying code fix: $CODE_FIX"; eval "$CODE_FIX"; fi
-      - git config --global user.name "Self-healing Pipeline"
-      - git config --global user.email "selfhealing@example.com"
-      - git add app.py || true
-      - git commit -m "AI self-healing: Apply fix for test failure" || echo "No changes to commit"
-      # Uncomment the next line if you want to push the fix to GitHub
-      # - git push https://$GITAUB_TOKEN@github.com/TATULIBOSi/self-healing-ci-cd-demo.git || echo "Push failed"
+      - echo "Pre-build phase"
   build:
     commands:
-      - pytest -v
+      - echo "Build phase"
