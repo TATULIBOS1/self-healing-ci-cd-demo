@@ -1,4 +1,4 @@
-name: AI-Powered Self-Healing CI/CD
+name: CI/CD Self-Healing Pipeline
 
 on: [push]
 
@@ -6,7 +6,8 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -14,87 +15,88 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: pip install flask pytest boto3
+        run: pip install flask pytest boto3 awscli jq
 
       - name: Run tests with detailed logging
-        id: run-tests
+        id: run_tests
         run: |
+          echo "Running pytest..."
           pytest --junitxml=test-results.xml -v > test_logs.txt 2>&1 || true
-          grep -E 'FAILED|ERROR' test_logs.txt > failure_summary.txt || echo "No failures detected"
-        continue-on-error: true
+          echo "Test logs:"
+          cat test_logs.txt
+          echo "Generating failure summary..."
+          grep -E 'FAILED|FAILURE|failure|ERROR|Exception|exception' test_logs.txt > failure_summary.txt || echo "Test failure detected, see test_logs.txt" > failure_summary.txt
+          echo "Failure summary:"
+          cat failure_summary.txt
+          if grep -qE 'FAILED|FAILURE|failure|ERROR|Exception|exception' test_logs.txt; then
+            echo "Tests failed, marking job as failed"
+            exit 1
+          fi
+
+      - name: Validate AWS Credentials
+        if: steps.run_tests.outcome == 'failure'
+        run: |
+          echo "Checking AWS credentials..."
+          if [[ -z "${{ secrets.AWS_ACCESS_KEY }}" || -z "${{ secrets.AWS_SECRET_KEY }}" ]]; then
+            echo "Error: AWS credentials missing"
+            exit 1
+          fi
+          export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY }}
+          export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_KEY }}
+          export AWS_DEFAULT_REGION=us-east-1
+          aws sts get-caller-identity > /tmp/identity.txt 2>&1 || { echo "Error: Invalid AWS credentials"; cat /tmp/identity.txt; exit 1; }
+          echo "Credentials valid, user: $(cat /tmp/identity.txt | jq -r '.Arn')"
+          echo "Checking S3 bucket access..."
+          aws s3 ls s3://ci-cd-demo-logs > /tmp/s3.txt 2>&1 || { echo "Error: Cannot access S3 bucket"; cat /tmp/s3.txt; exit 1; }
+          echo "S3 bucket accessible"
+
+      - name: Validate Step Functions ARN
+        if: steps.run_tests.outcome == 'failure'
+        run: |
+          echo "Checking Step Functions ARN..."
+          if [[ -z "${{ secrets.SFN_SELF_HEALING_ARN }}" || "${{ secrets.SFN_SELF_HEALING_ARN }}" == "***" ]]; then
+            echo "Error: SFN_SELF_HEALING_ARN missing or invalid"
+            exit 1
+          fi
+          export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY }}
+          export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_KEY }}
+          export AWS_DEFAULT_REGION=us-east-1
+          aws stepfunctions describe-state-machine --state-machine-arn "${{ secrets.SFN_SELF_HEALING_ARN }}" > /tmp/sfn.txt 2>&1 || { echo "Error: Invalid SFN ARN"; cat /tmp/sfn.txt; exit 1; }
+          echo "SFN ARN valid: ${{ secrets.SFN_SELF_HEALING_ARN }}"
 
       - name: Upload artifacts to S3
-        if: failure()
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
+        if: steps.run_tests.outcome == 'failure'
+        continue-on-error: true
         run: |
+          export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY }}
+          export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_KEY }}
+          export AWS_DEFAULT_REGION=us-east-1
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt
-          aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt
-          aws s3 cp test-results.xml s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/test_results.xml
+          echo "Files available:"
+          ls -l test_logs.txt failure_summary.txt || true
+          echo "Uploading to S3..."
+          aws s3 cp test_logs.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/full_logs.txt > /tmp/s3_upload_logs.txt 2>&1 || { echo "Warning: Failed to upload full_logs.txt"; cat /tmp/s3_upload_logs.txt; }
+          if [ -f failure_summary.txt ]; then
+            aws s3 cp failure_summary.txt s3://ci-cd-demo-logs/$GITHUB_RUN_ID/$TIMESTAMP/failure_summary.txt > /tmp/s3_upload_summary.txt 2>&1 || { echo "Warning: Failed to upload failure_summary.txt"; cat /tmp/s3_upload_summary.txt; }
+          else
+            echo "Warning: failure_summary.txt not found, skipping"
+          fi
+          echo "S3_PREFIX=$GITHUB_RUN_ID/$TIMESTAMP" >> $GITHUB_ENV
 
       - name: Trigger AI Analysis
-        if: failure()
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
-          S3_PREFIX: $GITHUB_RUN_ID/$TIMESTAMP
+        if: steps.run_tests.outcome == 'failure'
         run: |
+          export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY }}
+          export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_KEY }}
+          export AWS_DEFAULT_REGION=us-east-1
           EXECUTION_NAME="github-$GITHUB_RUN_ID-$(date +%s)"
+          echo "Starting Step Functions: $EXECUTION_NAME"
           RESPONSE=$(aws stepfunctions start-execution \
-            --state-machine-arn ${{ secrets.SFN_SELF_HEALING_ARN }} \
+            --state-machine-arn "${{ secrets.SFN_SELF_HEALING_ARN }}" \
             --name "$EXECUTION_NAME" \
-            --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"$S3_PREFIX\",\"github_run_id\":\"$GITHUB_RUN_ID\"}")
-
-          echo "SFN Execution ARN: $(echo $RESPONSE | jq -r '.executionArn')"
-          echo "SFN_RESPONSE=$RESPONSE" >> $GITHUB_ENV
-
-      - name: Wait for analysis completion
-        if: failure()
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
-        run: |
-          for i in {1..12}; do
-            STATUS=$(aws stepfunctions describe-execution \
-              --execution-arn $(echo $SFN_RESPONSE | jq -r '.executionArn') \
-              --query 'status' --output text)
-
-            if [ "$STATUS" = "SUCCEEDED" ]; then
-              echo "Analysis completed successfully"
-              break
-            elif [ "$STATUS" = "FAILED" ]; then
-              echo "Analysis failed"
-              exit 1
-            fi
-
-            sleep 10
-          done
-
-      - name: Show remediation plan
-        if: failure()
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          OUTPUT=$(aws stepfunctions describe-execution \
-            --execution-arn $(echo $SFN_RESPONSE | jq -r '.executionArn') \
-            --query 'output' --output text)
-
-          echo "=== AI Remediation Plan ==="
-          echo $OUTPUT | jq -r '.recommendations' || echo "No recommendations generated"
-          echo "========================="
-
-          if echo $OUTPUT | jq -e '.failure_type == "CRITICAL"'; then
-            echo "$OUTPUT" | jq -r '.recommendations' > issue_body.txt
-            gh issue create \
-              --title "Critical CI Failure in $GITHUB_SHA" \
-              --body-file issue_body.txt \
-              --label "bug,ci-failure"
+            --input "{\"s3_bucket\":\"ci-cd-demo-logs\",\"s3_prefix\":\"${{ env.S3_PREFIX }}\",\"github_run_id\":\"$GITHUB_RUN_ID\"}" 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "Error starting Step Functions: $RESPONSE"
+            exit 1
           fi
+          echo "SFN Execution ARN: $(echo $RESPONSE | jq -r '.executionArn')"
