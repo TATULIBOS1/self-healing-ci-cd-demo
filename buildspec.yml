@@ -9,8 +9,9 @@ phases:
   pre_build:
     commands:
       - echo "Pre-build phase"
+      - git checkout main || git checkout -b main
       - '[ -n "$CODE_FIX" ] && echo "Applying code fix: $CODE_FIX" && eval "$CODE_FIX" && git config --global user.name "Self-HealingCI" && git config --global user.email "selfhealing@example.com" && git add app.py && git commit -m "AI self-healing: Fix test failure" || echo "No code fix to apply"'
-      - git push https://$GITHUB_TOKEN@github.com/TATULIBOS1/self-healing-ci-cd-demo.git || echo "Push failed, check GITHUB_TOKEN"
+      - git push https://$GITHUB_TOKEN@github.com/TATULIBOS1/self-healing-ci-cd-demo.git main || echo "Push failed, check GITHUB_TOKEN"
   build:
     commands:
       - echo "Build phase"
