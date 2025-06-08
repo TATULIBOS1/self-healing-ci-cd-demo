@@ -1,6 +1,7 @@
-# test_app.py
-import unittest
+import pytest
+import app
 
-class TestApp(unittest.TestCase):
-    def test_fail(self):
-        self.assertEqual(1, 2, "სიმულირებული ჩავარდნა CI/CD პაიპლაინში")
+def test_home():
+    with app.app.test_client() as client:
+        response = client.get('/')
+        assert response.status_code == 200, "სიმულირებული ჩავარდნა CI/CD პაიპლაინში"
