@@ -19,9 +19,11 @@ jobs:
       - name: Run tests with detailed logging
         id: run-tests
         run: |
-          pytest --junitxml=test-results.xml -v > test_logs.txt 2>&1 || true
+          pytest --junitxml=test-results.xml -v > test_logs.txt 2>&1
           grep -E 'FAILED|ERROR' test_logs.txt > failure_summary.txt || echo "No failures detected"
-        continue-on-error: true
+          if grep -q 'FAILED\|ERROR' test_logs.txt; then
+            exit 1
+          fi
 
       - name: Upload artifacts to S3
         if: failure()
